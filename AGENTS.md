@@ -11,8 +11,8 @@ The proxy uses these configuration sources, in order of precedence:
 
 | Setting | Source | Details |
 |---|---|---|
-| Databricks endpoint URL | `DATABRICKS_AI_GATEWAY_URL` env var | **Required.** The proxy will not start without it. |
-| Available models | `models.json` in the repo root | Optional. Falls back to a built-in default list if absent. |
+| Databricks endpoint URL | `DATABRICKS_AI_GATEWAY_URL` env var | **Required.** Use the AI Gateway base URL; full endpoint URLs are normalized automatically. |
+| Available models and endpoint mapping | `models.json` in the repo root | Optional. Supports model IDs plus per-model endpoint alias mapping (`cursor`, `openai`, `mlflow`). |
 | Listen port | `--port` CLI argument | Default: `8080` |
 | Bind address | `--host` CLI argument | Default: `127.0.0.1` |
 
@@ -59,4 +59,3 @@ If you are modifying this project, **do not attempt the following**, as we have 
 1. Add tests — at minimum: unit tests for payload sanitization logic and SSE chunk enrichment; optionally integration tests using a mock HTTP server
 2. Consider adding a `--models-file` CLI argument to allow specifying a custom models file path
 3. Investigate whether the Databricks AI Gateway exposes an API endpoint to dynamically fetch available model IDs (would eliminate the need to maintain `models.json` manually)
-

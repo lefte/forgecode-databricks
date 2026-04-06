@@ -17,25 +17,26 @@ This Python proxy (`databricks_proxy.py`) acts as a transparent middleware layer
 
 - **Mocks the `/models` Route:** It returns a list of available Databricks models (see step two below) allowing ForgeCode to initialize successfully.
 - **Sanitizes Outgoing Requests:** It intercepts `POST /chat/completions`, stripping out the incompatible parameters (`parallel_tool_calls`, `response_format`, `stream_options`) before forwarding the payload to Databricks.
+- **Routes Per Model Family:** It maps each model to the correct Databricks endpoint path (for example `databricks-gpt*` → `/cursor/v1/chat/completions`, `databricks-claude*` → `/mlflow/v1/chat/completions`) and forwards each request accordingly.
 - **Enriches Incoming Streams:** It parses the SSE stream returning from Databricks, injects the missing OpenAI metadata into every chunk, ensures perfect `\n\n` framing, and properly handles the `[DONE]` signal so ForgeCode can render the live stream flawlessly.
 
 ## Setup
 
 ### 1. Set your Databricks AI Gateway URL
 
-The proxy requires one environment variable: your Databricks AI Gateway chat completions endpoint.
+The proxy requires one environment variable: your Databricks AI Gateway base URL. It will derive the host and then append the model-specific endpoint path from `models.json`.
 
 **Option A — Shell export (current session only):**
 
 ```bash
-export DATABRICKS_AI_GATEWAY_URL="https://<workspace-id>.ai-gateway.azuredatabricks.net/mlflow/v1/chat/completions"
+export DATABRICKS_AI_GATEWAY_URL="https://<workspace-id>.ai-gateway.azuredatabricks.net"
 ```
 
 **Option B — Persist it in your shell profile (recommended):**
 
 ```bash
 # Add to ~/.zshrc or ~/.bash_profile, then restart your terminal or run `source ~/.zshrc`
-export DATABRICKS_AI_GATEWAY_URL="https://<workspace-id>.ai-gateway.azuredatabricks.net/mlflow/v1/chat/completions"
+export DATABRICKS_AI_GATEWAY_URL="https://<workspace-id>.ai-gateway.azuredatabricks.net"
 ```
 
 **Option C — `.env` file:** *(Useful for sharing with coworkers, or Mom)*
@@ -47,10 +48,25 @@ source .env
 ```
 
 > Your endpoint URL is found in the Databricks workspace under **AI Gateway → your endpoint → View endpoint details**.
+> Existing full endpoint values (for example `/mlflow/v1/chat/completions`) are still accepted; the proxy will normalize them to the gateway base URL.
 
-### 2. (Optional) Customize the model list
+### 2. (Optional) Customize model-to-endpoint mapping
 
-Edit `models.json` to match the models enabled in your AI Gateway. The proxy loads this file automatically on startup; if it's missing, a built-in default list is used.
+Edit `models.json` to match the models enabled in your AI Gateway and assign each to an endpoint alias (`cursor`, `mlflow`, or `openai`). The proxy loads this file automatically on startup; if it's missing, a built-in default list and endpoint rules are used. For chat-completions payloads (`messages`), the proxy automatically prefers `cursor` over `openai` when both exist, to avoid Responses API payload mismatch errors.
+
+```json
+{
+  "endpoints": {
+    "mlflow": "/mlflow/v1/chat/completions",
+    "cursor": "/cursor/v1/chat/completions",
+    "openai": "/openai/v1/responses"
+  },
+  "models": [
+    {"id": "databricks-claude-haiku-4-5", "endpoint": "mlflow"},
+    {"id": "databricks-gpt-5-3-codex", "endpoint": "cursor"}
+  ]
+}
+```
 
 ### 3. Run the proxy
 
@@ -82,4 +98,3 @@ forge config set model databricks-claude-sonnet-4-6
 You can verify your settings with `forge info` or `:info`.
 
 *[F-D Bridge was built with the help of both Google Gemini and GitHub Copilot, with Erik Hanson in the architect seat.]*
-
