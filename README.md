@@ -55,7 +55,7 @@ source .env
 Edit `models.json` to match the models enabled in your AI Gateway and assign each to an endpoint alias (`cursor`, `mlflow`, or `openai`). The proxy loads this file automatically on startup; if it's missing, a built-in default list and endpoint rules are used. For chat-completions payloads (`messages`), the proxy automatically prefers `cursor` over `openai` when both exist, to avoid Responses API payload mismatch errors. For periodic updates to this list, I have browsed to the Databricks AI Gateway dashboard and copied the table of models to a file, then used the following prompt to help populate the models JSON file:
 
 ```bash
-I have create a new markdown file @[databricks-models.md] that contains the most-current updated list of Databricks models copied from the website. Scrape this file for the new model names and update the @[models.json] file with the appropriate new and updated models. Use the same endpoint logic as before (gpt models use cursor, anthropic models use mlflow) I think the new models in markdown can be read using a 4n-3 formula, where the model names are on lines 1, 5, 9, 13, 17, 21, and so on.
+I have created a new markdown file @[databricks-models.md] that contains the most-current updated list of Databricks models copied from the website. Scrape this file for the new model names and update the @[models.json] file with the appropriate new and updated models. Use the same endpoint logic as before (gpt models use cursor, anthropic models use mlflow) I think the new models in markdown can be read using a 4n-3 formula, where the model names are on lines 1, 5, 9, 13, 17, 21, and so on.
 ```
 
 ```json
