@@ -20,6 +20,8 @@
     {"id": "databricks-gemini-2-5-flash", "endpoint": "mlflow"},
     {"id": "databricks-gemini-2-5-pro", "endpoint": "mlflow"},
     {"id": "databricks-gpt-5", "endpoint": "cursor"},
+    {"id": "databricks-gpt-5-5", "endpoint": "cursor"},
+    {"id": "databricks-gpt-5-5-pro", "endpoint": "cursor"},
     {"id": "databricks-gpt-5-mini", "endpoint": "cursor"},
     {"id": "databricks-gpt-5-nano", "endpoint": "cursor"},
     {"id": "databricks-claude-sonnet-4-5", "endpoint": "mlflow"},
