@@ -405,7 +405,7 @@ def sanitize_payload(payload: dict[str, object]) -> tuple[dict[str, object], str
         sanitized["max_tokens"] = sanitized.pop("max_completion_tokens")
 
     # Strip keys known to cause 400 errors on Databricks
-    for key in ["parallel_tool_calls", "stream_options", "store", "metadata", "logprobs", "top_logprobs"]:
+    for key in ["parallel_tool_calls", "stream_options", "store", "metadata", "logprobs", "top_logprobs", "reasoning_effort"]:
         sanitized.pop(key, None)
 
     # Strip response_format when streaming — Databricks rejects structured output + stream
