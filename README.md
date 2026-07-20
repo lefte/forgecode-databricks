@@ -18,7 +18,9 @@ This Python proxy (`databricks_proxy.py`) acts as a transparent middleware layer
 - **Mocks the `/models` Route:** It returns a list of available Databricks models (see step two below) allowing ForgeCode to initialize successfully.
 - **Sanitizes Outgoing Requests:** It intercepts `POST /chat/completions`, stripping out the incompatible parameters (`parallel_tool_calls`, `response_format`, `stream_options`) before forwarding the payload to Databricks.
 - **Routes Per Model Family:** It maps each model to the correct Databricks endpoint path (for example `databricks-gpt*` → `/cursor/v1/chat/completions`, `databricks-claude*` → `/mlflow/v1/chat/completions`) and forwards each request accordingly.
+- **Adapts Chat ↔ Responses Payloads for GPT Cursor Models:** Some cursor-backed GPT models enforce Responses API semantics (`input`, `max_output_tokens`) even on chat-completions routes. The proxy converts request/response shapes so chat-style clients keep working.
 - **Enriches Incoming Streams:** It parses the SSE stream returning from Databricks, injects the missing OpenAI metadata into every chunk, ensures perfect `\n\n` framing, and properly handles the `[DONE]` signal so ForgeCode can render the live stream flawlessly.
+- **Normalizes Structured `delta.content`:** Some Databricks/Claude streaming chunks emit structured arrays (for reasoning summaries) where strict clients expect a plain string. The proxy now coerces non-string `delta.content` into text so OpenAI-compatible client validators do not fail.
 
 ## Setup
 
@@ -52,7 +54,7 @@ source .env
 
 ### 2. (Optional) Customize model-to-endpoint mapping
 
-Edit `models.json` to match the models enabled in your AI Gateway and assign each to an endpoint alias (`cursor`, `mlflow`, or `openai`). The proxy loads this file automatically on startup; if it's missing, a built-in default list and endpoint rules are used. For chat-completions payloads (`messages`), the proxy automatically prefers `cursor` over `openai` when both exist, to avoid Responses API payload mismatch errors. For periodic updates to this list, I have browsed to the Databricks AI Gateway dashboard and copied the table of models to a file, then used the following prompt to help populate the models JSON file:
+Edit `models.json` to match the models enabled in your AI Gateway and assign each to an endpoint alias (`cursor`, `mlflow`, or `openai`). The proxy loads this file automatically on startup; if it's missing, a built-in default list and endpoint rules are used. The bridge also auto-adapts chat-completions payloads to Responses-style fields when required by cursor/openai-backed models. For periodic updates to this list, I have browsed to the Databricks AI Gateway dashboard and copied the table of models to a file, then used the following prompt to help populate the models JSON file:
 
 ```bash
 I have created a new markdown file @[databricks-models.md] that contains the most-current updated list of Databricks models copied from the website. Scrape this file for the new model names and update the @[models.json] file with the appropriate new and updated models. Use the same endpoint logic as before (gpt models use cursor, anthropic models use mlflow) I think the new models in markdown can be read using a 4n-3 formula, where the model names are on lines 1, 5, 9, 13, 17, 21, and so on.
@@ -79,6 +81,8 @@ python3 databricks_proxy.py
 # Optional flags:
 #   --port 9090       bind to a different port (default: 8080)
 #   --host 0.0.0.0    bind to all interfaces (default: 127.0.0.1)
+#   --upstream-timeout 300   upstream read timeout seconds before keep-alive logic
+#   --max-read-timeouts 24   consecutive timeouts allowed before ending stream
 ```
 
 ### 4. Configure ForgeCode (First time only)
@@ -100,5 +104,51 @@ forge config set model databricks-claude-sonnet-4-6
 ```
 
 You can verify your settings with `forge info` or `:info`.
+
+## Troubleshooting
+
+### `Unauthorized: Invalid access token`
+
+If direct `curl` to Databricks works but proxy clients fail, the most common cause is client-side auth config drift:
+
+- Keep one active PAT value everywhere (do not mix old/new keys across files or profiles).
+- For OpenCode with `@ai-sdk/openai-compatible`, use `options.apiKey` (camelCase), not `apikey`.
+- Enter raw token only (no `Bearer ` prefix in saved key fields).
+
+### Type validation error: `choices[0].delta.content` expected string, received array
+
+This happens when upstream emits structured reasoning blocks in stream chunks. The proxy now flattens those to string content before forwarding. Restart the proxy after pulling the latest changes.
+
+### Bad Request: `Unsupported parameter: 'messages'`
+
+Some cursor GPT models require Responses-style request fields (`input`, `max_output_tokens`) and reject `messages`. The proxy now auto-converts chat-style messages into Responses payloads for these models.
+
+### Bad Request: `Invalid value: 'tool'` (`input[n]`)
+
+This indicates tool-result turns were forwarded as chat role `tool` in a Responses request. The proxy now maps:
+
+- assistant tool calls → `type: "function_call"` items
+- tool messages → `type: "function_call_output"` items
+
+to keep multi-step tool loops valid.
+
+### Partial reply then early `[DONE]` (especially with tool-calling)
+
+The stream parser now buffers complete SSE events (including multi-line `data:` payloads), translates `response.output_item.done` function calls into `delta.tool_calls`, and emits `finish_reason: "tool_calls"` when appropriate so clients continue execution instead of stopping early.
+
+### `!!! Bridge Error: The read operation timed out`
+
+Long-running requests can legitimately go quiet for extended periods. The proxy now sends SSE keep-alive comments on upstream read timeouts and only terminates after a configurable number of consecutive timeouts. Tune with:
+
+- `--upstream-timeout` (seconds per upstream read wait)
+- `--max-read-timeouts` (how many consecutive waits before ending the stream)
+
+## Credential rotation checklist
+
+Rotate any credential that appeared in terminal history, chat, logs, or local config during debugging:
+
+1. Databricks PAT(s) used for this proxy/provider.
+2. OpenCode provider API key entries for `forgecode-databricks` (replace with the new PAT everywhere it is stored).
+3. Any other non-redacted API keys currently present in local OpenCode config/auth files (for example BrowserStack, xAI, Mistral, Ollama, MCP auth headers), if they were exposed in shared logs/chat.
 
 *[F-D Bridge was built with the help of both Google Gemini and GitHub Copilot, with Erik Hanson in the architect seat.]*

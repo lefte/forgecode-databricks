@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -132,6 +133,8 @@ def load_models() -> tuple[list[str], dict[str, str], dict[str, str], str]:
 
 MODELS, MODEL_ENDPOINT_ALIASES, ENDPOINT_PATHS, _MODELS_SOURCE = load_models()
 DATABRICKS_BASE_URL = ""
+UPSTREAM_TIMEOUT_SECONDS = 300
+MAX_READ_TIMEOUTS = 24
 
 
 def extract_gateway_base_url(configured_url: str) -> str:
@@ -177,7 +180,7 @@ def resolve_endpoint_path(
 
 
 def resolve_target_url(endpoint_path: str) -> str:
-    return urljoin(f"{DATABRICKS_BASE_URL}/", endpoint_path.lstrip("/"))
+    return urljoin(f"{DATABRICKS_BASE_URL}/ai-gateway/", endpoint_path.lstrip("/"))
 
 
 def _as_responses_content(role: str, content: object) -> list[dict[str, str]]:
@@ -203,6 +206,49 @@ def _as_responses_content(role: str, content: object) -> list[dict[str, str]]:
     return []
 
 
+def _coerce_message_content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+        return "".join(text_parts)
+    return ""
+
+
+def _tool_call_to_response_item(tool_call: object) -> dict[str, object] | None:
+    if not isinstance(tool_call, dict):
+        return None
+    if tool_call.get("type") != "function":
+        return None
+
+    function_obj = tool_call.get("function")
+    if not isinstance(function_obj, dict):
+        return None
+    function_name = function_obj.get("name")
+    if not isinstance(function_name, str) or not function_name:
+        return None
+    arguments = function_obj.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = ""
+
+    call_id = tool_call.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        call_id = f"call_{uuid.uuid4().hex}"
+
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": function_name,
+        "arguments": arguments,
+    }
+
+
 def convert_chat_to_responses_payload(payload: dict[str, object]) -> dict[str, object]:
     converted = dict(payload)
     raw_messages = converted.get("messages")
@@ -216,12 +262,33 @@ def convert_chat_to_responses_payload(payload: dict[str, object]) -> dict[str, o
         role = message.get("role")
         if not isinstance(role, str):
             continue
+
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                continue
+            output_text = _coerce_message_content_to_text(message.get("content"))
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": tool_call_id,
+                "output": output_text,
+            })
+            continue
+
         responses_content = _as_responses_content(role, message.get("content"))
         if responses_content:
             input_items.append({
                 "role": role,
                 "content": responses_content,
             })
+
+        if role == "assistant":
+            raw_tool_calls = message.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                for tool_call in raw_tool_calls:
+                    response_item = _tool_call_to_response_item(tool_call)
+                    if response_item is not None:
+                        input_items.append(response_item)
 
     converted["input"] = input_items
     converted.pop("messages", None)
@@ -307,6 +374,33 @@ def adapt_payload_for_endpoint(
     return adapted
 
 
+def _extract_text_from_response_output_item(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: list[str] = []
+    for content_part in content:
+        if not isinstance(content_part, dict):
+            continue
+        text = content_part.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+            continue
+        summary = content_part.get("summary")
+        if not isinstance(summary, list):
+            continue
+        for summary_item in summary:
+            if not isinstance(summary_item, dict):
+                continue
+            summary_text = summary_item.get("text")
+            if isinstance(summary_text, str):
+                text_parts.append(summary_text)
+    return "".join(text_parts)
+
+
 def _build_chat_completion_chunk(
     req_id: str,
     created_time: int,
@@ -327,12 +421,83 @@ def _build_chat_completion_chunk(
     }
 
 
+def _build_tool_call_delta_chunk(
+    req_id: str,
+    created_time: int,
+    req_model: str,
+    tool_call_index: int,
+    call_id: str,
+    function_name: str,
+    arguments: str,
+    include_role: bool,
+) -> dict[str, object]:
+    delta: dict[str, object] = {
+        "tool_calls": [{
+            "index": tool_call_index,
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "arguments": arguments,
+            },
+        }],
+    }
+    if include_role:
+        delta["role"] = "assistant"
+    return _build_chat_completion_chunk(
+        req_id=req_id,
+        created_time=created_time,
+        req_model=req_model,
+        delta=delta,
+        finish_reason=None,
+    )
+
+
+def _coerce_delta_content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        return ""
+
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+
+        text = part.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+            continue
+
+        # Databricks can stream Claude reasoning blocks as structured arrays.
+        # Keep downstream chat chunk schema valid by flattening summary text.
+        summary = part.get("summary")
+        if not isinstance(summary, list):
+            continue
+        for summary_item in summary:
+            if not isinstance(summary_item, dict):
+                continue
+            summary_text = summary_item.get("text")
+            if isinstance(summary_text, str):
+                text_parts.append(summary_text)
+
+    return "".join(text_parts)
+
+
 def _transform_upstream_chunk(
     raw_chunk: dict[str, object],
     req_id: str,
     created_time: int,
     req_model: str,
     needs_role_chunk: bool,
+    stream_state: dict[str, object],
 ) -> tuple[list[dict[str, object]], bool]:
     transformed_chunks: list[dict[str, object]] = []
 
@@ -356,6 +521,8 @@ def _transform_upstream_chunk(
             if needs_role_chunk:
                 delta["role"] = "assistant"
                 needs_role_chunk = False
+            if "content" in delta:
+                delta["content"] = _coerce_delta_content_to_text(delta["content"])
             if "content" not in delta and choice.get("finish_reason") is None and "tool_calls" not in delta:
                 delta["content"] = ""
         chunk.pop("usage", None)
@@ -370,6 +537,7 @@ def _transform_upstream_chunk(
         delta_text = raw_chunk.get("delta")
         if not isinstance(delta_text, str):
             delta_text = ""
+        stream_state["saw_text_delta"] = True
         delta: dict[str, object] = {"content": delta_text}
         if needs_role_chunk:
             delta["role"] = "assistant"
@@ -383,13 +551,89 @@ def _transform_upstream_chunk(
         ))
         return transformed_chunks, needs_role_chunk
 
+    if event_type == "response.output_item.done":
+        output_item = raw_chunk.get("item")
+        if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+            call_id_value = output_item.get("call_id")
+            if not isinstance(call_id_value, str) or not call_id_value:
+                call_id_value = output_item.get("id") if isinstance(output_item.get("id"), str) else f"call_{uuid.uuid4().hex}"
+            function_name = output_item.get("name")
+            if not isinstance(function_name, str) or not function_name:
+                function_name = "unknown_function"
+            arguments = output_item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = ""
+
+            tool_indices = stream_state.get("tool_call_indices")
+            if not isinstance(tool_indices, dict):
+                tool_indices = {}
+                stream_state["tool_call_indices"] = tool_indices
+            tool_call_index = tool_indices.get(call_id_value)
+            if not isinstance(tool_call_index, int):
+                next_tool_call_index = stream_state.get("next_tool_call_index", 0)
+                tool_call_index = next_tool_call_index if isinstance(next_tool_call_index, int) else 0
+                tool_indices[call_id_value] = tool_call_index
+                stream_state["next_tool_call_index"] = tool_call_index + 1
+
+            transformed_chunks.append(_build_tool_call_delta_chunk(
+                req_id=req_id,
+                created_time=created_time,
+                req_model=req_model,
+                tool_call_index=tool_call_index,
+                call_id=call_id_value,
+                function_name=function_name,
+                arguments=arguments,
+                include_role=needs_role_chunk,
+            ))
+            needs_role_chunk = False
+            stream_state["saw_tool_call"] = True
+            return transformed_chunks, needs_role_chunk
+
+        output_text = _extract_text_from_response_output_item(output_item)
+        saw_text_delta = bool(stream_state.get("saw_text_delta"))
+        if output_text and not saw_text_delta:
+            delta: dict[str, object] = {"content": output_text}
+            if needs_role_chunk:
+                delta["role"] = "assistant"
+                needs_role_chunk = False
+            transformed_chunks.append(_build_chat_completion_chunk(
+                req_id=req_id,
+                created_time=created_time,
+                req_model=req_model,
+                delta=delta,
+                finish_reason=None,
+            ))
+            stream_state["emitted_text_from_output_item_done"] = True
+        return transformed_chunks, needs_role_chunk
+
     if event_type == "response.completed":
+        saw_tool_call = bool(stream_state.get("saw_tool_call"))
+        saw_text_delta = bool(stream_state.get("saw_text_delta"))
+        emitted_text_from_output_item_done = bool(stream_state.get("emitted_text_from_output_item_done"))
+        if not saw_text_delta and not emitted_text_from_output_item_done:
+            output = raw_chunk.get("response")
+            if isinstance(output, dict):
+                response_output = output.get("output")
+                if isinstance(response_output, list):
+                    combined_text = "".join(_extract_text_from_response_output_item(item) for item in response_output)
+                    if combined_text:
+                        delta: dict[str, object] = {"content": combined_text}
+                        if needs_role_chunk:
+                            delta["role"] = "assistant"
+                            needs_role_chunk = False
+                        transformed_chunks.append(_build_chat_completion_chunk(
+                            req_id=req_id,
+                            created_time=created_time,
+                            req_model=req_model,
+                            delta=delta,
+                            finish_reason=None,
+                        ))
         transformed_chunks.append(_build_chat_completion_chunk(
             req_id=req_id,
             created_time=created_time,
             req_model=req_model,
             delta={},
-            finish_reason="stop",
+            finish_reason="tool_calls" if saw_tool_call else "stop",
         ))
         return transformed_chunks, needs_role_chunk
 
@@ -466,8 +710,9 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 print("<<< Bridge: Client disconnected.", flush=True)
                 return False
 
+        headers_sent = False
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
                 print(f"<<< Bridge: Streaming {response.status}...", flush=True)
                 try:
                     self.send_response(response.status)
@@ -475,6 +720,7 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     self.end_headers()
+                    headers_sent = True
                 except (BrokenPipeError, ConnectionResetError):
                     print("<<< Bridge: Client disconnected before headers.", flush=True)
                     return
@@ -482,35 +728,94 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 req_id = f"chatcmpl-{uuid.uuid4()}"
                 created_time = int(time.time())
                 needs_role_chunk = True
+                stream_state: dict[str, object] = {}
+                consecutive_read_timeouts = 0
+                pending_event_lines: list[str] = []
 
                 while True:
-                    line = response.readline()
+                    try:
+                        line = response.readline()
+                    except (TimeoutError, socket.timeout):
+                        consecutive_read_timeouts += 1
+                        print(
+                            f"!!! Bridge: Upstream read timed out ({consecutive_read_timeouts}/{MAX_READ_TIMEOUTS}); keeping stream alive.",
+                            flush=True,
+                        )
+                        if consecutive_read_timeouts >= MAX_READ_TIMEOUTS:
+                            print("!!! Bridge: Max upstream read timeouts reached; ending stream.", flush=True)
+                            if headers_sent:
+                                write_to_client(b"data: [DONE]\n\n")
+                            return
+                        if headers_sent and not write_to_client(b": keep-alive\n\n"):
+                            return
+                        continue
+
+                    consecutive_read_timeouts = 0
                     if not line:
+                        # Flush any buffered SSE event if upstream closed without trailing blank line.
+                        if pending_event_lines:
+                            line_str = "\n".join(pending_event_lines)
+                            pending_event_lines = []
+                            if line_str == "[DONE]":
+                                if not write_to_client(b"data: [DONE]\n\n"):
+                                    return
+                            else:
+                                try:
+                                    raw_chunk = json.loads(line_str)
+                                    if isinstance(raw_chunk, dict):
+                                        transformed_chunks, needs_role_chunk = _transform_upstream_chunk(
+                                            raw_chunk=raw_chunk,
+                                            req_id=req_id,
+                                            created_time=created_time,
+                                            req_model=req_model,
+                                            needs_role_chunk=needs_role_chunk,
+                                            stream_state=stream_state,
+                                        )
+                                        for transformed_chunk in transformed_chunks:
+                                            if not write_to_client(f"data: {json.dumps(transformed_chunk)}\n\n".encode("utf-8")):
+                                                return
+                                except json.JSONDecodeError:
+                                    pass
                         break
 
-                    line_str = line.decode("utf-8", errors="replace").strip()
-
-                    if line_str.startswith("data: "):
-                        if line_str == "data: [DONE]":
+                    line_str = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line_str == "":
+                        if not pending_event_lines:
+                            continue
+                        event_payload = "\n".join(pending_event_lines)
+                        pending_event_lines = []
+                        if event_payload == "[DONE]":
                             if not write_to_client(b"data: [DONE]\n\n"):
                                 return
-                        else:
-                            try:
-                                raw_chunk = json.loads(line_str[6:])
-                                if not isinstance(raw_chunk, dict):
-                                    continue
-                                transformed_chunks, needs_role_chunk = _transform_upstream_chunk(
-                                    raw_chunk=raw_chunk,
-                                    req_id=req_id,
-                                    created_time=created_time,
-                                    req_model=req_model,
-                                    needs_role_chunk=needs_role_chunk,
-                                )
-                                for transformed_chunk in transformed_chunks:
-                                    if not write_to_client(f"data: {json.dumps(transformed_chunk)}\n\n".encode("utf-8")):
-                                        return
-                            except json.JSONDecodeError:
+                            continue
+                        try:
+                            raw_chunk = json.loads(event_payload)
+                            if not isinstance(raw_chunk, dict):
                                 continue
+                            transformed_chunks, needs_role_chunk = _transform_upstream_chunk(
+                                raw_chunk=raw_chunk,
+                                req_id=req_id,
+                                created_time=created_time,
+                                req_model=req_model,
+                                needs_role_chunk=needs_role_chunk,
+                                stream_state=stream_state,
+                            )
+                            for transformed_chunk in transformed_chunks:
+                                if not write_to_client(f"data: {json.dumps(transformed_chunk)}\n\n".encode("utf-8")):
+                                    return
+                        except json.JSONDecodeError:
+                            continue
+                        continue
+
+                    if line_str.startswith(":"):
+                        # Upstream keep-alive comment.
+                        continue
+                    if line_str.startswith("data:"):
+                        payload_part = line_str[5:]
+                        if payload_part.startswith(" "):
+                            payload_part = payload_part[1:]
+                        pending_event_lines.append(payload_part)
+                        continue
 
                 print("<<< Bridge: Done.", flush=True)
 
@@ -526,8 +831,11 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"!!! Bridge Error: {e}", flush=True)
             try:
-                self.send_response(500)
-                self.end_headers()
+                if headers_sent:
+                    write_to_client(b"data: [DONE]\n\n")
+                else:
+                    self.send_response(500)
+                    self.end_headers()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -536,7 +844,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ForgeCode ↔ Databricks AI Gateway Bridge")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind to (default: 127.0.0.1)")
+    parser.add_argument(
+        "--upstream-timeout",
+        type=int,
+        default=UPSTREAM_TIMEOUT_SECONDS,
+        help="Upstream connect/read timeout seconds before keep-alive logic engages (default: 300)",
+    )
+    parser.add_argument(
+        "--max-read-timeouts",
+        type=int,
+        default=MAX_READ_TIMEOUTS,
+        help="Number of consecutive upstream read timeouts before ending the stream (default: 24)",
+    )
     args = parser.parse_args()
+    UPSTREAM_TIMEOUT_SECONDS = max(1, args.upstream_timeout)
+    MAX_READ_TIMEOUTS = max(1, args.max_read_timeouts)
 
     configured_gateway_url = os.environ.get("DATABRICKS_AI_GATEWAY_URL")
     if not configured_gateway_url:
@@ -562,6 +884,7 @@ if __name__ == "__main__":
   Endpoints    : cursor -> {ENDPOINT_PATHS.get("cursor", _DEFAULT_ENDPOINT_PATHS["cursor"])}
                  openai -> {ENDPOINT_PATHS.get("openai", _DEFAULT_ENDPOINT_PATHS["openai"])}
                  mlflow -> {ENDPOINT_PATHS.get("mlflow", _DEFAULT_ENDPOINT_PATHS["mlflow"])}
+  Timeouts     : upstream={UPSTREAM_TIMEOUT_SECONDS}s, max consecutive read timeouts={MAX_READ_TIMEOUTS}
 
   Configure ForgeCode (first time only):
     forge provider login openai_compatible

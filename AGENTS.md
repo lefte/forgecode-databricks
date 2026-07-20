@@ -31,10 +31,10 @@ The proxy (`databricks_proxy.py`) handles three major architectural incompatibil
    - **Fix:** The proxy mocks `GET /models` by returning a JSON list of 32 known Databricks model IDs (e.g., `databricks-claude-sonnet-4-6`).
 2. **The Payload Block (`POST /chat/completions`)**
    - **Issue:** ForgeCode automatically includes `parallel_tool_calls`, `stream_options`, `store`, and `metadata`. When ForgeCode requests `stream: true`, it occasionally also forces `response_format: {"type": "json_object"}`. Databricks strict validation rejects these with a `400 Bad Request` ("Structured output is not currently supported with streaming").
-   - **Fix:** The proxy intercepts the JSON payload, gracefully deletes these incompatible keys, and forwards the cleaned request to the Databricks API.
+   - **Fix:** The proxy intercepts the JSON payload, gracefully deletes these incompatible keys, and forwards the cleaned request to the Databricks API. For cursor/openai-backed GPT models that enforce Responses semantics, it also adapts chat payloads (`messages`, `max_tokens`, assistant `tool_calls`, tool-role messages) into valid Responses `input` items (`function_call` / `function_call_output` included).
 3. **The Streaming Block (SSE Deserialization)**
    - **Issue:** Databricks streams the text back, but it omits several standard OpenAI metadata fields (like `id`, `object`, `created`, `index`, and `model`). ForgeCode relies on `reqwest-eventsource` which uses strict Rust structs. If these fields are missing, ForgeCode silently drops the chunks or hangs indefinitely on "Synthesizing" because it assumes the packet is malformed.
-   - **Fix:** The proxy parses every incoming `data: {...}` line from Databricks. It injects a UUID for `id`, sets `object: chat.completion.chunk`, adds a Unix timestamp for `created`, and ensures `delta.content` exists if `finish_reason` is null. It also aggressively strips the `usage` object from Databricks because it contains non-standard Anthropic extensions that crash ForgeCode. Finally, it ensures perfect `\n\n` framing and a clean `Connection: close` on the final `[DONE]` signal.
+   - **Fix:** The proxy now performs event-based SSE parsing (multi-line `data:` framing safe), injects OpenAI chunk metadata (`id`, `object`, `created`, `index`, `model`), and ensures `delta.content` exists when needed. It also coerces non-string `delta.content` payloads (for example structured Claude reasoning arrays) into plain text, maps Responses tool-call events (like `response.output_item.done`) into chat `delta.tool_calls`, and emits `finish_reason: tool_calls` when appropriate so tool loops continue. It aggressively strips `usage` fields containing non-standard Anthropic extensions that can crash strict clients.
 
 ## What We Tried That Did Not Work
 
@@ -54,6 +54,10 @@ If you are modifying this project, **do not attempt the following**, as we have 
 - ✅ Startup message shows full configuration instructions (ForgeCode login command, model selection)
 - ✅ Graceful `KeyboardInterrupt` / Ctrl+C handling — no more debug tracebacks on exit
 - ✅ Python best practices: bare `except:` replaced with `except Exception:`, f-strings, consistent quote style, `pathlib` for file paths
+- ✅ Streaming normalization fix: non-string `choices[].delta.content` values are flattened to text for OpenAI-compatible client validation
+- ✅ Troubleshooting docs added for OpenCode auth pitfalls (`apiKey` casing, token drift across auth files) and credential rotation workflow
+- ✅ Long-running stream resilience: configurable upstream timeout, keep-alive comments, and bounded consecutive read-timeout handling
+- ✅ Responses-compat bridge for cursor GPT models: chat payload conversion, tool-role mapping (`function_call_output`), and tool-call stream translation (`delta.tool_calls`)
 
 **Remaining tasks for the AI agent reading this:**
 1. Add tests — at minimum: unit tests for payload sanitization logic and SSE chunk enrichment; optionally integration tests using a mock HTTP server
