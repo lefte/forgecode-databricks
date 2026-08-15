@@ -525,7 +525,33 @@ def _transform_upstream_chunk(
                 delta["content"] = _coerce_delta_content_to_text(delta["content"])
             if "content" not in delta and choice.get("finish_reason") is None and "tool_calls" not in delta:
                 delta["content"] = ""
-        chunk.pop("usage", None)
+        # Sanitize usage: keep only standard OpenAI fields to avoid crashing strict
+        # clients on non-standard Anthropic extensions (cache_read_input_tokens, etc.).
+        # Only attach usage on the final chunk (when finish_reason is set).
+        raw_usage = raw_chunk.get("usage")
+        has_finish_reason = any(
+            isinstance(c, dict) and c.get("finish_reason") is not None
+            for c in raw_choices
+        )
+        if isinstance(raw_usage, dict) and has_finish_reason:
+            prompt_tokens = raw_usage.get("prompt_tokens")
+            completion_tokens = raw_usage.get("completion_tokens")
+            total_tokens = raw_usage.get("total_tokens")
+            clean_usage: dict[str, object] = {}
+            if isinstance(prompt_tokens, int):
+                clean_usage["prompt_tokens"] = prompt_tokens
+            if isinstance(completion_tokens, int):
+                clean_usage["completion_tokens"] = completion_tokens
+            if isinstance(total_tokens, int):
+                clean_usage["total_tokens"] = total_tokens
+            elif isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                clean_usage["total_tokens"] = prompt_tokens + completion_tokens
+            if clean_usage:
+                chunk["usage"] = clean_usage
+            else:
+                chunk.pop("usage", None)
+        else:
+            chunk.pop("usage", None)
         transformed_chunks.append(chunk)
         return transformed_chunks, needs_role_chunk
 
@@ -628,13 +654,30 @@ def _transform_upstream_chunk(
                             delta=delta,
                             finish_reason=None,
                         ))
-        transformed_chunks.append(_build_chat_completion_chunk(
+        finish_chunk = _build_chat_completion_chunk(
             req_id=req_id,
             created_time=created_time,
             req_model=req_model,
             delta={},
             finish_reason="tool_calls" if saw_tool_call else "stop",
-        ))
+        )
+        # Extract usage from response.completed payload if available.
+        response_obj = raw_chunk.get("response")
+        if isinstance(response_obj, dict):
+            raw_usage = response_obj.get("usage")
+            if isinstance(raw_usage, dict):
+                prompt_tokens = raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens")
+                completion_tokens = raw_usage.get("output_tokens") or raw_usage.get("completion_tokens")
+                clean_usage: dict[str, object] = {}
+                if isinstance(prompt_tokens, int):
+                    clean_usage["prompt_tokens"] = prompt_tokens
+                if isinstance(completion_tokens, int):
+                    clean_usage["completion_tokens"] = completion_tokens
+                if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                    clean_usage["total_tokens"] = prompt_tokens + completion_tokens
+                if clean_usage:
+                    finish_chunk["usage"] = clean_usage
+        transformed_chunks.append(finish_chunk)
         return transformed_chunks, needs_role_chunk
 
     return transformed_chunks, needs_role_chunk
